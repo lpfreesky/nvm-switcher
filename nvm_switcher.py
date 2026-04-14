@@ -1,11 +1,13 @@
 __version__ = "1.0.0"
 
+import sys
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import subprocess
 import re
 import os
 import shutil
+import threading
 
 
 class NvmSwitcherApp:
@@ -15,10 +17,12 @@ class NvmSwitcherApp:
         self.root.title(f"NVM Node.js 版本切换器  v{NvmSwitcherApp.VERSION}")
         self.root.geometry("520x450")
         self.root.resizable(False, False)
+        self._center_window()
 
         self.current_version = tk.StringVar(value="检测中...")
         self.installed_versions = []
         self.nvm_path = self.find_nvm()
+        self._busy = False
 
         self._set_icon()
         self._build_ui()
@@ -58,9 +62,24 @@ class NvmSwitcherApp:
                 return os.path.join(p, "nvm.exe")
         return None
 
+    def _center_window(self):
+        try:
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+            self.root.update_idletasks()
+            ww = self.root.winfo_width()
+            wh = self.root.winfo_height()
+            self.root.geometry(f"+{(sw - ww)//2}+{(sh - wh)//2}")
+        except Exception:
+            pass
+
     def _set_icon(self):
         try:
-            icon_path = os.path.join(os.path.dirname(__file__), "icon.ico")
+            # exe 打包后 __file__ 会指向临时目录，icon.ico 随包一起
+            if getattr(sys, '_MEIPASS', None):
+                icon_path = os.path.join(sys._MEIPASS, 'icon.ico')
+            else:
+                icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
             if os.path.exists(icon_path):
                 self.root.iconbitmap(icon_path)
         except Exception:
@@ -128,9 +147,13 @@ class NvmSwitcherApp:
         btn_frame = ttk.Frame(self.root)
         btn_frame.pack(pady=15)
 
-        ttk.Button(btn_frame, text="刷新列表", width=12, command=self.refresh_versions).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="切换版本", width=12, command=self.switch_version).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="安装 LTS", width=12, command=self.install_lts).pack(side=tk.LEFT, padx=5)
+        btn_refresh = ttk.Button(btn_frame, text="刷新列表", width=12, command=self.refresh_versions)
+        btn_switch = ttk.Button(btn_frame, text="切换版本", width=12, command=self.switch_version)
+        btn_install = ttk.Button(btn_frame, text="安装 LTS", width=12, command=self.install_lts)
+        btn_refresh.pack(side=tk.LEFT, padx=5)
+        btn_switch.pack(side=tk.LEFT, padx=5)
+        btn_install.pack(side=tk.LEFT, padx=5)
+        self._action_buttons = [btn_refresh, btn_switch, btn_install]
 
         # 状态栏
         self.status_var = tk.StringVar(value="就绪")
@@ -142,70 +165,80 @@ class NvmSwitcherApp:
         if not self.nvm_path:
             return False, "", "未找到 nvm，请先安装或手动指定路径。"
         try:
-            ps_cmd = f'& "{self.nvm_path}" {" ".join(args)}'
             result = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", ps_cmd],
+                ["powershell", "-NoProfile", "-Command", f'& "{self.nvm_path}" {" ".join(args)}'],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
                 timeout=120
             )
-            if result.returncode != 0 and not result.stdout.strip():
-                result = subprocess.run(
-                    ["cmd", "/c", f'"{self.nvm_path}" {" ".join(args)}'],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=120
-                )
             return True, result.stdout, result.stderr
         except Exception as e:
             return False, "", str(e)
+
+    def _set_buttons(self, enabled):
+        """启用/禁用操作按钮，防止加载中重复点击"""
+        state = tk.NORMAL if enabled else tk.DISABLED
+        for btn in self._action_buttons:
+            btn.config(state=state)
 
     def refresh_versions(self):
         if not self.nvm_path:
             self.status_var.set("未找到 nvm")
             return
+        if self._busy:
+            return
+        self._busy = True
         self.status_var.set("正在刷新...")
-        self.root.update_idletasks()
+        self.version_listbox.delete(0, tk.END)
+        self._set_buttons(False)
 
-        ok, out, err = self._run_nvm(["current"])
-        if ok and out.strip():
-            ver = out.strip().splitlines()[0]
-            self.current_version.set(ver if ver else "未检测到")
-        else:
-            self.current_version.set("未检测到")
+        def do():
+            ok, out, err = self._run_nvm(["list"])
+            self.root.after(0, self._on_refresh_done, ok, out, err)
 
-        ok, out, err = self._run_nvm(["list"])
+        threading.Thread(target=do, daemon=True).start()
+
+    def _on_refresh_done(self, ok, out, err):
         self.installed_versions = []
         self.version_listbox.delete(0, tk.END)
 
         if not ok:
-            messagebox.showerror("错误", f"无法运行 nvm 命令:\n{err}")
             self.status_var.set("运行 nvm 失败")
+            self._busy = False
+            self._set_buttons(True)
+            messagebox.showerror("错误", f"无法运行 nvm 命令:\n{err}")
             return
 
-        current_raw = self.current_version.get()
+        current_ver = None
         for line in out.splitlines():
-            line = line.strip()
-            if not line:
+            line_stripped = line.strip()
+            if not line_stripped:
                 continue
-            ver = re.sub(r"^\s*[*>]\s*", "", line)
-            ver = re.sub(r"\s*\(.*", "", ver)
-            ver = ver.strip()
+            if current_ver is None and ("*" in line_stripped or ">" in line_stripped):
+                raw = re.sub(r"^\s*[*>]\s*", "", line_stripped)
+                raw = re.sub(r"\s*\(.*", "", raw).strip()
+                if re.match(r"^v?\d+", raw):
+                    current_ver = raw
+            ver = re.sub(r"^\s*[*>]\s*", "", line_stripped)
+            ver = re.sub(r"\s*\(.*", "", ver).strip()
             if re.match(r"^v?\d+", ver):
                 self.installed_versions.append(ver)
                 display = ver
-                if ver == current_raw or ("v" + current_raw == ver) or (current_raw == "v" + ver):
+                if ver == current_ver or ("v" + str(current_ver) == ver) or (str(current_ver) == "v" + ver):
                     display = f">> {ver}  (当前)"
                 self.version_listbox.insert(tk.END, display)
                 if "(当前)" in display:
                     self.version_listbox.selection_set(tk.END)
                     self.version_listbox.see(tk.END)
 
+        if current_ver:
+            self.current_version.set(current_ver)
+
         self.status_var.set(f"共 {len(self.installed_versions)} 个已安装版本")
+        self._busy = False
+        self._set_buttons(True)
 
     def switch_version(self):
         selection = self.version_listbox.curselection()
@@ -221,18 +254,30 @@ class NvmSwitcherApp:
             messagebox.showinfo("提示", f"当前已经是 {ver}")
             return
 
+        if self._busy:
+            return
+        self._busy = True
         self.status_var.set(f"正在切换到 {ver} ...")
-        self.root.update_idletasks()
+        self._set_buttons(False)
 
-        ok, out, err = self._run_nvm(["use", ver])
+        def do():
+            ok, out, err = self._run_nvm(["use", ver])
+            self.root.after(0, self._on_switch_done, ok, out, err, ver)
+
+        threading.Thread(target=do, daemon=True).start()
+
+    def _on_switch_done(self, ok, out, err, ver):
         combined = (out + "\n" + err).lower()
         if ok and ("success" in combined or "now using" in combined or "现在使用" in combined or "is now" in combined):
             messagebox.showinfo("成功", f"已切换到 Node.js {ver}")
+            self._busy = False
             self.refresh_versions()
         else:
             msg = out.strip() if out.strip() else err.strip()
             messagebox.showerror("失败", f"切换失败:\n{msg}")
             self.status_var.set("切换失败")
+            self._busy = False
+            self._set_buttons(True)
 
     def install_lts(self):
         if not self.nvm_path:
@@ -240,11 +285,21 @@ class NvmSwitcherApp:
             return
         if not messagebox.askyesno("确认", "确定要安装最新的 LTS 版本吗？"):
             return
+        if self._busy:
+            return
+        self._busy = True
         self.status_var.set("正在安装 LTS 版本，请稍候...")
-        self.root.update_idletasks()
+        self._set_buttons(False)
 
-        ok, out, err = self._run_nvm(["install", "lts"])
+        def do():
+            ok, out, err = self._run_nvm(["install", "lts"])
+            self.root.after(0, self._on_install_done, ok, out, err)
+
+        threading.Thread(target=do, daemon=True).start()
+
+    def _on_install_done(self, ok, out, err):
         messagebox.showinfo("安装结果", out.strip() if out.strip() else err.strip())
+        self._busy = False
         self.refresh_versions()
 
 
